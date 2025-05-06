@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 import os
+import json
+
 
 
 class VideoProcessingThread(QThread):
@@ -55,6 +57,8 @@ class VideoProcessingThread(QThread):
         self.fly_trail_history = {}
         self.center_gender_duration = {}  # Initialize the dictionary to store center duration for each gender
         self.pre_mating_center_gender_duration = {}  # Initialize the dictionary to store pre-mating center duration for each gender
+        self.roi_details = {}
+
 
     def export_combined_mating_times(self):
         combined_mating_times = {}
@@ -201,6 +205,15 @@ class VideoProcessingThread(QThread):
 
         # Draw ROI numbers
         for i, contour_data in enumerate(initial_contours):
+            # Example of calculating the radius from the contour (simplified)
+            radius = max(w, h) / 2  # Use the maximum of width and height to ensure the circle covers the object
+
+            # Update or add the radius to your data structure, e.g., self.roi_details
+            self.roi_details[i] = {
+                'center': (int(x + w / 2), int(y + h / 2)),
+                'radius': radius
+            }
+
             (x, y, w, h) = cv2.boundingRect(contour_data["contour"])
             center_x = int(x + w / 2)
             center_y = int(y + h / 2)
@@ -230,7 +243,7 @@ class VideoProcessingThread(QThread):
         radius = 6  # Increase the radius for larger dots
         thickness = -1  # Set the thickness to a negative value for a hollow circle
 
-        grace_frames_threshold = int(self.fps * 3 / self.perf_frame_skips)  # Assuming 1 second of real-time
+        grace_frames_threshold = int(self.fps * 10 / self.perf_frame_skips)  # Assuming 1 second of real-time
 
         center_threshold = 32  # Define a threshold for how close to the center is considered 'in the center'
 
@@ -246,8 +259,13 @@ class VideoProcessingThread(QThread):
             # Convert the masked frame to grayscale (if not already done)
             gray = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2GRAY)
 
-            kernel = np.ones((5, 5), np.uint8)
-            gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+            # Kernel for morphological operations
+            kernel = np.ones((6, 6), np.uint8)
+
+            # Apply morphological operations to close gaps and make blobs stick together
+            gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel, iterations=1)
+            gray = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel, iterations=1)  # Stronger dilation
+            gray = cv2.morphologyEx(gray, cv2.MORPH_ERODE, kernel, iterations=1)  # Stronger erosion
 
             # Continue with the existing blob detection
             keypoints = detector.detect(gray)
@@ -378,8 +396,13 @@ class VideoProcessingThread(QThread):
                         if duration_since_last_event > self.center_mating_event_end_threshold:
                             # Reset the start frame for the next event, instead of deleting it
                             self.center_mating_start_frame[i] = frame_count
-                            self.fly_trail_history[i] = []
                             self.mating_event_ongoing[i] = False
+                            if i in self.mating_durations and any(
+                                        duration >= 360 for duration in self.mating_durations[i]):
+                                    pass
+                            else:
+                                self.fly_trail_history[i] = []
+
 
 
             else:  # Mating event has potentially ended
@@ -508,6 +531,52 @@ class VideoProcessingThread(QThread):
     def void_roi(self, roi_id):
         self.void_rois[roi_id] = True
         self.void_roi_signal.emit(self.video_path, roi_id)  # Emit the signal to indicate a void ROI
+
+    def export_roi_locations(self):
+        video_info = {
+            'video_path': self.video_path,
+            'video_dimensions': {
+                'width': None,
+                'height': None
+            },
+            'processing_parameters': {
+                'resize_dimensions': None,  # Add actual resize dimensions if applicable
+                'crop_dimensions': None  # Add actual crop dimensions if applicable
+            },
+            'roi_details': [],
+            'fly_trail_history': {}  # New field to store fly trail history
+        }
+
+        # Attempt to capture video dimensions
+        cap = cv2.VideoCapture(self.video_path)
+        if cap.isOpened():
+            width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            video_info['video_dimensions']['width'] = width
+            video_info['video_dimensions']['height'] = height
+        cap.release()
+
+        # Export the detailed information of each ROI, including the calculated radius
+        for roi_id, details in self.roi_details.items():
+            roi_info = {
+                'id': roi_id,
+                'center': details['center'],
+                'radius': details['radius'],
+                'void': self.void_rois.get(roi_id, False),
+                'has_mating_start_time': roi_id in self.mating_start_times
+            }
+            video_info['roi_details'].append(roi_info)
+
+        # Include fly trail history for each ROI
+        for roi_id, trail in self.fly_trail_history.items():
+            # Convert each point in the trail from a tuple to a list for JSON serialization
+            video_info['fly_trail_history'][roi_id] = [list(point) for point in trail]
+
+        export_path = os.path.splitext(self.video_path)[0] + '_roi_details_with_behavior.json'
+        with open(export_path, 'w') as file:
+            json.dump(video_info, file, indent=4)
+
+        print(f"ROI details with mating behavior exported to {export_path}")
 
 
 class MainWindow(QMainWindow):
@@ -759,17 +828,35 @@ class MainWindow(QMainWindow):
         self.start_queue_button.clicked.connect(self.start_processing_queue)
         self.start_queue_button.setGeometry(1200, 440, 300, 30)  # Adjust geometry as needed
 
+        video_queue_layout = QVBoxLayout()
+
+        self.export_roi_button = QPushButton("Export ROI Locations")
+        self.export_roi_button.clicked.connect(self.export_roi_locations)
+        export_group.layout().addWidget(self.export_roi_button)  # Add button to the export group layout
+
+    def export_roi_locations(self):
+        current_video_path = self.video_paths[self.current_video_index]
+        video_thread = self.video_threads.get(current_video_path)
+        if video_thread:
+            video_thread.export_roi_locations()
+        else:
+            print("Error: No active video thread found for the current video.")
+
     def add_videos_to_queue(self):
         directory = QFileDialog.getExistingDirectory(self, "Select Directory with AVI Files")
         if directory:
-            # Scan for AVI files within the selected directory
-            for filename in os.listdir(directory):
-                if filename.endswith(".avi"):
-                    video_path = os.path.join(directory, filename)
-                    if video_path not in self.video_queue:
-                        self.set_fps_from_video(video_path)
-                        self.video_queue.append(video_path)
-                        self.video_queue_list_widget.addItem(filename)
+            # Walk through the directory and its subdirectories
+            for root, dirs, files in os.walk(directory):
+                for filename in files:
+                    # Check if the file is an .avi file and does not start with ._
+                    if filename.endswith(".mp4") and not filename.startswith("._"):
+                        video_path = os.path.join(root, filename)
+                        if video_path not in self.video_queue:
+                            self.set_fps_from_video(video_path)
+                            self.video_queue.append(video_path)
+                            # Display the relative path from the selected directory
+                            relative_path = os.path.relpath(video_path, directory)
+                            self.video_queue_list_widget.addItem(relative_path)
 
     def clear_video_queue(self):
         # Clear the video queue and update the list widget
